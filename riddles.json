@@ -1,27 +1,12 @@
 [
   {
     "id": 1,
-    "question": "I speak without a mouth and hear without ears. What am I?",
-    "answer": "An echo."
-  },
-  {
-    "id": 2,
     "question": "What has keys but can’t open locks?",
     "answer": "A piano."
   },
   {
-    "id": 3,
-    "question": "I have branches, but no fruit, trunk or leaves. What am I?",
-    "answer": "A bank."
-  },
-  {
-    "id": 4,
-    "question": "What can you break, even if you never pick it up or touch it?",
-    "answer": "A promise."
-  },
-  {
-    "id": 5,
-    "question": "The more of this there is, the less you see. What is it?",
-    "answer": "Darkness."
+    "id": 2,
+    "question": "I speak without a mouth and hear without ears. What am I?",
+    "answer": "An echo."
   }
 ]

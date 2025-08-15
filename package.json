@@ -1,15 +1,17 @@
 {
-  "name": "brain-bender-daily-editly",
+  "name": "brain-bender-daily",
   "version": "1.0.0",
-  "description": "Automated riddle shorts generator with dynamic backgrounds, voice over and countdown using Editly.",
-  "type": "module",
+  "description": "Automated generation and upload of riddle shorts using ffmpeg",
   "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "express": "^4.18.2",
-    "googleapis": "^121.0.0",
+    "googleapis": "^125.0.0",
     "google-tts-api": "^2.0.1",
-    "node-fetch": "^3.3.1",
-    "editly": "^0.13.0",
+    "node-fetch": "^2.6.9",
+    "ffmpeg-static": "^4.4.0",
     "node-cron": "^3.0.2"
   }
 }
