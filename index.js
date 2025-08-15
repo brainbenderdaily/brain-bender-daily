@@ -98,99 +98,224 @@ async function generateSpeech(text) {
   }
 }
 
-// Create video using Editly with countdown, answer and CTA
+// Create a more dynamic video using Editly with countdown, answer and CTA
 async function createVideo(question, answer, backgroundPath, audioPath) {
   const outputPath = path.join(process.cwd(), 'output.mp4');
-  // Build the edit specification
-  const clips = [];
-  // Intro with question
-  clips.push({
-    duration: 4,
-    layers: [
-      backgroundPath
-        ? { type: 'image', path: backgroundPath }
-        : { type: 'solid-color', color: '#1d1d1d' },
-      {
-        type: 'title',
-        text: question,
-        color: 'white',
-        fontSize: 60,
-        x: 0.5,
-        y: 0.4,
-        alignX: 'center',
-        alignY: 'middle',
-      },
-    ],
-  });
-  // Countdown 3,2,1
-  ['3', '2', '1'].forEach((num) => {
-    clips.push({
-      duration: 1,
-      layers: [
-        backgroundPath
-          ? { type: 'image', path: backgroundPath }
-          : { type: 'solid-color', color: '#0f0f0f' },
-        {
-          type: 'title',
-          text: num,
-          color: '#ff5555',
-          fontSize: 120,
-          x: 0.5,
-          y: 0.5,
-          alignX: 'center',
-          alignY: 'middle',
-        },
-      ],
-    });
-  });
-  // Reveal answer
-  clips.push({
-    duration: 4,
-    layers: [
-      backgroundPath
-        ? { type: 'image', path: backgroundPath }
-        : { type: 'solid-color', color: '#1d1d1d' },
-      {
-        type: 'title',
-        text: `Answer: ${answer}`,
-        color: '#ffdd00',
-        fontSize: 60,
-        x: 0.5,
-        y: 0.4,
-        alignX: 'center',
-        alignY: 'middle',
-      },
-    ],
-  });
-  // Call to action
-  clips.push({
-    duration: 3,
-    layers: [
-      backgroundPath
-        ? { type: 'image', path: backgroundPath }
-        : { type: 'solid-color', color: '#0f0f0f' },
-      {
-        type: 'title',
-        text: 'Follow for daily brain benders!',
-        color: '#00ddff',
-        fontSize: 40,
-        x: 0.5,
-        y: 0.6,
-        alignX: 'center',
-        alignY: 'middle',
-      },
-    ],
-  });
-  // Build and render video
-  await editly({
+
+  // Choose a fallback solid colour background if none is provided
+  const bgLayer = backgroundPath
+    ? { type: 'image', path: backgroundPath }
+    : { type: 'solid-color', color: '#101010' };
+
+  // Helper to clone bg layer for each clip (editly expects independent objects)
+  function cloneBg() {
+    return { ...bgLayer };
+  }
+
+  // Build the edit specification with multiple scenes, countdown and CTA
+  const spec = {
     outPath: outputPath,
     width: 1080,
     height: 1920,
     fps: 30,
     audioFilePath: audioPath || undefined,
-    clips,
-    defaultTransition: { duration: 0.5 },
-  });
+    defaultTransition: { duration: 0.5, name: 'fade' },
+    clips: [
+      // Intro slide
+      {
+        duration: 2,
+        layers: [
+          cloneBg(),
+          {
+            type: 'title',
+            text: 'Brain Bender',
+            fontSize: 80,
+            color: '#FFD700',
+            x: 0.5,
+            y: 0.3,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+          {
+            type: 'title',
+            text: "Today's Riddle",
+            fontSize: 40,
+            color: '#AAAAFF',
+            x: 0.5,
+            y: 0.55,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+        ],
+      },
+      // Question slide
+      {
+        duration: 5,
+        layers: [
+          cloneBg(),
+          {
+            type: 'title',
+            text: question,
+            fontSize: 60,
+            color: '#FFFFFF',
+            x: 0.5,
+            y: 0.4,
+            alignX: 'center',
+            alignY: 'middle',
+            wrap: true,
+          },
+          {
+            type: 'title',
+            text: 'Think about it…',
+            fontSize: 32,
+            color: '#BBBBBB',
+            x: 0.5,
+            y: 0.8,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+        ],
+      },
+      // Countdown: 3
+      {
+        duration: 1,
+        layers: [
+          cloneBg(),
+          {
+            type: 'title',
+            text: 'Answer in…',
+            fontSize: 36,
+            color: '#DDDDDD',
+            x: 0.5,
+            y: 0.2,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+          {
+            type: 'title',
+            text: '3',
+            fontSize: 120,
+            color: '#FF5555',
+            x: 0.5,
+            y: 0.5,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+        ],
+      },
+      // Countdown: 2
+      {
+        duration: 1,
+        layers: [
+          cloneBg(),
+          {
+            type: 'title',
+            text: 'Answer in…',
+            fontSize: 36,
+            color: '#DDDDDD',
+            x: 0.5,
+            y: 0.2,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+          {
+            type: 'title',
+            text: '2',
+            fontSize: 120,
+            color: '#FFAA33',
+            x: 0.5,
+            y: 0.5,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+        ],
+      },
+      // Countdown: 1
+      {
+        duration: 1,
+        layers: [
+          cloneBg(),
+          {
+            type: 'title',
+            text: 'Answer in…',
+            fontSize: 36,
+            color: '#DDDDDD',
+            x: 0.5,
+            y: 0.2,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+          {
+            type: 'title',
+            text: '1',
+            fontSize: 120,
+            color: '#FFFF55',
+            x: 0.5,
+            y: 0.5,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+        ],
+      },
+      // Answer slide
+      {
+        duration: 5,
+        layers: [
+          cloneBg(),
+          {
+            type: 'title',
+            text: `Answer: ${answer}`,
+            fontSize: 60,
+            color: '#00FFAA',
+            x: 0.5,
+            y: 0.4,
+            alignX: 'center',
+            alignY: 'middle',
+            wrap: true,
+          },
+          {
+            type: 'title',
+            text: 'Did you get it right?',
+            fontSize: 32,
+            color: '#8888FF',
+            x: 0.5,
+            y: 0.8,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+        ],
+      },
+      // Call-to-action slide
+      {
+        duration: 3,
+        layers: [
+          cloneBg(),
+          {
+            type: 'title',
+            text: 'Follow @BrainBenderDaily',
+            fontSize: 50,
+            color: '#00BFFF',
+            x: 0.5,
+            y: 0.4,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+          {
+            type: 'title',
+            text: 'for daily brain benders!',
+            fontSize: 32,
+            color: '#FF77FF',
+            x: 0.5,
+            y: 0.6,
+            alignX: 'center',
+            alignY: 'middle',
+          },
+        ],
+      },
+    ],
+  };
+  // Render video
+  await editly(spec);
   return outputPath;
 }
 
