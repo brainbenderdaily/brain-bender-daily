@@ -1,17 +1,15 @@
 {
-  "name": "bbd-dynamic",
+  "name": "brain-bender-daily-editly",
   "version": "1.0.0",
-  "description": "Brain Bender Daily Dynamic Shorts Generator",
+  "description": "Automated riddle shorts generator with dynamic backgrounds, voice over and countdown using Editly.",
+  "type": "module",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
   "dependencies": {
-    "axios": "^1.6.2",
     "express": "^4.18.2",
+    "googleapis": "^121.0.0",
     "google-tts-api": "^2.0.1",
-    "googleapis": "^125.0.0",
-    "node-cron": "^3.0.2",
-    "ffmpeg-static": "^5.0.0"
+    "node-fetch": "^3.3.1",
+    "editly": "^0.13.0",
+    "node-cron": "^3.0.2"
   }
 }
