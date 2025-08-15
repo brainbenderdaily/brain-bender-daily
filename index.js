@@ -34,10 +34,26 @@ function getOAuthClient() {
   return oauth2Client;
 }
 
-// Fetch a random portrait image from Pexels
+// Fetch a random background. Prefer a local asset; fall back to Pexels API if available.
 async function getRandomBackground(query = 'abstract background') {
   try {
-    if (!PEXELS_API_KEY) return null;
+    // Look for bundled backgrounds in the assets directory
+    const assetsDir = new URL('./assets', import.meta.url);
+    const files = await fs.readdir(assetsDir);
+    const candidates = files.filter((f) =>
+      f.match(/\.(png|jpg|jpeg)$/i),
+    );
+    if (candidates.length > 0) {
+      const choice = candidates[Math.floor(Math.random() * candidates.length)];
+      const localPath = path.join(path.dirname(assetsDir.pathname), choice);
+      return localPath;
+    }
+  } catch (err) {
+    // ignore local errors and try remote
+  }
+  // Attempt to download from Pexels if API key is provided
+  if (!PEXELS_API_KEY) return null;
+  try {
     const apiUrl = `https://api.pexels.com/v1/search?query=${encodeURIComponent(
       query,
     )}&orientation=portrait&per_page=30`;
@@ -47,20 +63,20 @@ async function getRandomBackground(query = 'abstract background') {
     if (!response.ok) throw new Error(`Pexels API error ${response.status}`);
     const data = await response.json();
     const photos = data.photos || [];
-    if (!photos.length) return null;
-    const randomPhoto = photos[Math.floor(Math.random() * photos.length)];
-    // Prefer the portrait or original size for vertical video
-    const imageUrl =
-      randomPhoto.src.portrait || randomPhoto.src.large || randomPhoto.src.original;
-    const imgRes = await fetch(imageUrl);
-    const buffer = await imgRes.arrayBuffer();
-    const filePath = path.join(process.cwd(), 'background.jpg');
-    await fs.writeFile(filePath, Buffer.from(buffer));
-    return filePath;
+    if (photos.length) {
+      const randomPhoto = photos[Math.floor(Math.random() * photos.length)];
+      const imageUrl =
+        randomPhoto.src.portrait || randomPhoto.src.large || randomPhoto.src.original;
+      const imgRes = await fetch(imageUrl);
+      const buffer = await imgRes.arrayBuffer();
+      const filePath = path.join(process.cwd(), 'background.jpg');
+      await fs.writeFile(filePath, Buffer.from(buffer));
+      return filePath;
+    }
   } catch (err) {
-    console.error('Failed to fetch background:', err.message);
-    return null;
+    console.error('Failed to fetch remote background:', err.message);
   }
+  return null;
 }
 
 // Generate speech using google-tts-api and save to mp3
