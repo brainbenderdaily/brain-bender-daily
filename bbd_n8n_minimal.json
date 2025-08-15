@@ -1,0 +1,11 @@
+{
+  "nodes": [
+    {
+      "id": "1",
+      "name": "Start",
+      "type": "n8n-nodes-base.start",
+      "position": [40, 40]
+    }
+  ],
+  "connections": {}
+}
