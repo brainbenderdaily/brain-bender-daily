@@ -1,176 +1,218 @@
 const express = require('express');
-const { google } = require('googleapis');
-const ffmpeg = require('fluent-ffmpeg');
-const ffmpegStatic = require('ffmpeg-static');
-const Jimp = require('jimp');
 const fs = require('fs');
 const path = require('path');
+const { google } = require('googleapis');
+const Jimp = require('jimp');
+const { execFile } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
-// Load riddles from JSON data folder
-const riddles = require('./data/riddles.json');
+/*
+ * Minimal Brain Bender Daily API
+ *
+ * This server exposes a handful of HTTP endpoints to support an
+ * automated, faceless YouTube channel.  The heavy lifting of
+ * synthesising video from text has been stripped down to the bare
+ * essentials: generate a simple image with the riddle and answer
+ * using Jimp, then convert that image into a short silent video
+ * using ffmpeg.  This drastically reduces memory usage compared
+ * with more complex pipelines while still producing a valid MP4
+ * suitable for YouTube Shorts.  OAuth credentials are provided via
+ * environment variables, and you only need to authorise once to
+ * obtain a refresh token.  See README for usage.
+ */
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Configure OAuth2 client for YouTube uploads.  The refresh token
-// should be stored in the environment so uploads can occur without
-// further user interaction.  The redirect URI defaults to the
-// Render deployment URL but can be overridden via ENV.
+// OAuth2 configuration.  A redirect URI can be customised via
+// REDIRECT_URI, but defaults to the standard Render callback.  You
+// must set YOUTUBE_CLIENT_ID, YOUTUBE_CLIENT_SECRET and
+// YOUTUBE_REFRESH_TOKEN in your environment.
+const CLIENT_ID = process.env.YOUTUBE_CLIENT_ID;
+const CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET;
+const REDIRECT_URI = process.env.REDIRECT_URI || 'https://brain-bender-daily.onrender.com/oauth2callback';
+const REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN;
+
+// Configure the OAuth2 client and YouTube API client
 const oauth2Client = new google.auth.OAuth2(
-  process.env.YOUTUBE_CLIENT_ID,
-  process.env.YOUTUBE_CLIENT_SECRET,
-  process.env.REDIRECT_URI || 'https://brain-bender-daily.onrender.com/oauth2callback'
+  CLIENT_ID,
+  CLIENT_SECRET,
+  REDIRECT_URI
 );
-
-// If a refresh token is available, set it so API calls will use it
-if (process.env.YOUTUBE_REFRESH_TOKEN) {
-  oauth2Client.setCredentials({ refresh_token: process.env.YOUTUBE_REFRESH_TOKEN });
+if (REFRESH_TOKEN) {
+  oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
 }
+const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
 
 /**
- * Generate an image with the given text.  The image is a black
- * rectangle sized for a vertical short (1080×1920) with white
- * centered text.  Lines are automatically wrapped to fit.
+ * Split a string into lines no longer than maxChars per line.
+ * This helps ensure the text fits neatly onto the generated image.
  *
- * @param {string} text The text to render on the image
- * @param {string} outputPath Path where the image should be written
+ * @param {string} text
+ * @param {number} maxChars
+ * @returns {string[]}
  */
-async function generateImage(text, outputPath) {
-  const width = 1080;
-  const height = 1920;
-  // Create a blank black image
-  const image = new Jimp(width, height, 0x000000ff);
-  const font = await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE);
-  const margin = 50;
-  const maxWidth = width - margin * 2;
-  const words = text.split(' ');
-  let lines = [];
-  let currentLine = '';
-  // Construct lines that fit within maxWidth
-  for (const word of words) {
-    const testLine = currentLine ? `${currentLine} ${word}` : word;
-    const testWidth = Jimp.measureText(font, testLine);
-    if (testWidth > maxWidth && currentLine) {
-      lines.push(currentLine);
-      currentLine = word;
-    } else {
-      currentLine = testLine;
+function wrapText(text, maxChars) {
+  const words = text.split(/\s+/);
+  const lines = [];
+  let current = '';
+  words.forEach(word => {
+    // If adding this word would exceed the limit, push the current
+    // line and start a new one.
+    if ((current + word).length > maxChars) {
+      lines.push(current.trim());
+      current = '';
     }
-  }
-  if (currentLine) lines.push(currentLine);
-  const lineHeight = Jimp.measureTextHeight(font, 'A', maxWidth);
-  const totalHeight = lines.length * lineHeight;
-  let y = (height - totalHeight) / 2;
-  for (const line of lines) {
-    const lineWidth = Jimp.measureText(font, line);
-    const x = (width - lineWidth) / 2;
-    image.print(font, x, y, line);
-    y += lineHeight;
-  }
-  await image.writeAsync(outputPath);
+    current += word + ' ';
+  });
+  if (current.trim()) lines.push(current.trim());
+  return lines;
 }
 
 /**
- * Convert a single frame image into a silent video using ffmpeg.  The
- * resulting video will be 20 seconds long to satisfy YouTube Shorts
- * duration requirements.
+ * Generate an image containing the riddle and its answer.  Uses a
+ * square canvas to ensure proper aspect ratio when converting to
+ * video.  Text is centred vertically and horizontally.
  *
- * @param {string} imagePath Path to the PNG file to convert
- * @param {string} outputPath Path where the MP4 should be written
+ * @param {string} text Combined question and answer
+ * @param {string} outPath Path to save the PNG file
  */
-async function generateVideo(imagePath, outputPath) {
+async function generateImage(text, outPath) {
+  const size = 640; // 640x640 square canvas
+  const background = 0xffffffff; // white background
+  const image = new Jimp(size, size, background);
+  const font = await Jimp.loadFont(Jimp.FONT_SANS_32_BLACK);
+  const lines = wrapText(text, 40);
+  // Calculate total text height to centre vertically
+  const lineHeight = Jimp.measureTextHeight(font, 'A', size);
+  const totalHeight = lines.length * lineHeight + (lines.length - 1) * 10;
+  let y = (size - totalHeight) / 2;
+  lines.forEach(line => {
+    const textWidth = Jimp.measureText(font, line);
+    const x = (size - textWidth) / 2;
+    image.print(font, x, y, line);
+    y += lineHeight + 10;
+  });
+  await image.writeAsync(outPath);
+}
+
+/**
+ * Convert a still image into a short MP4 using ffmpeg.  Uses
+ * a single image looped for the duration with libx264 encoding.
+ *
+ * @param {string} imagePath Path to the input PNG
+ * @param {string} outPath Path to save the MP4
+ * @param {number} durationSeconds Video duration
+ */
+function generateVideo(imagePath, outPath, durationSeconds = 20) {
   return new Promise((resolve, reject) => {
-    ffmpeg.setFfmpegPath(ffmpegStatic);
-    ffmpeg()
-      .addInput(imagePath)
-      .loop(20)
-      .outputOptions([
-        '-c:v libx264',
-        '-pix_fmt yuv420p',
-        '-t 20'
-      ])
-      .save(outputPath)
-      .on('end', resolve)
-      .on('error', reject);
+    const args = [
+      '-y',
+      '-loop', '1',
+      '-i', imagePath,
+      '-c:v', 'libx264',
+      '-t', String(durationSeconds),
+      '-pix_fmt', 'yuv420p',
+      outPath
+    ];
+    execFile(ffmpegPath, args, (err) => {
+      if (err) return reject(err);
+      resolve();
+    });
   });
 }
 
 /**
- * Upload a video file to YouTube as a private video.  Requires
- * authenticated oauth2Client with a valid refresh token.
+ * Upload a video to YouTube.  Expects the OAuth2 client to have
+ * valid refresh credentials.  The video will be uploaded as
+ * unlisted by default.
  *
- * @param {string} filePath Path to the MP4 to upload
- * @param {string} title Title for the YouTube video
- * @param {string} description Description for the YouTube video
+ * @param {string} videoPath Path to the MP4 file
+ * @param {string} title Video title
+ * @param {string} description Video description
+ * @returns {Promise<string>} Video ID
  */
-async function uploadVideo(filePath, title, description) {
-  const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-  const res = await youtube.videos.insert({
+async function uploadVideo(videoPath, title, description) {
+  const response = await youtube.videos.insert({
     part: ['snippet', 'status'],
     requestBody: {
-      snippet: { title, description, categoryId: '27' },
-      status: { privacyStatus: 'private' }
+      snippet: {
+        title,
+        description
+      },
+      status: {
+        privacyStatus: 'private'
+      }
     },
-    media: { body: fs.createReadStream(filePath) }
+    media: {
+      mimeType: 'video/mp4',
+      body: fs.createReadStream(videoPath)
+    }
   });
-  return res.data;
+  return response.data.id;
 }
 
-// Endpoint to generate and upload a short video.  A random riddle is
-// chosen, an image is rendered with the riddle and answer, a video
-// is produced, uploaded to YouTube, then temporary files are removed.
+/**
+ * Primary endpoint: generate a video from a random riddle and upload
+ * it to YouTube.  Responds with the chosen riddle and the video ID.
+ */
 app.get('/make', async (req, res) => {
   try {
-    const riddle = riddles[Math.floor(Math.random() * riddles.length)];
-    const text = `${riddle.question}\n\nAnswer: ${riddle.answer}`;
-    const imgPath = path.join(__dirname, 'temp_image.png');
-    const videoPath = path.join(__dirname, 'temp_video.mp4');
-    await generateImage(text, imgPath);
-    await generateVideo(imgPath, videoPath);
-    const result = await uploadVideo(videoPath, riddle.question, riddle.answer);
+    const riddles = JSON.parse(
+      fs.readFileSync(path.join(__dirname, 'data', 'riddles.json'), 'utf8')
+    );
+    const random = riddles[Math.floor(Math.random() * riddles.length)];
+    const combinedText = `${random.question}\n\nAnswer: ${random.answer}`;
+    const imagePath = path.join(__dirname, 'temp.png');
+    const videoPath = path.join(__dirname, 'output.mp4');
+    await generateImage(combinedText, imagePath);
+    await generateVideo(imagePath, videoPath);
+    const videoId = await uploadVideo(
+      videoPath,
+      random.question,
+      random.answer
+    );
     // Clean up temporary files
-    fs.unlinkSync(imgPath);
-    fs.unlinkSync(videoPath);
-    res.json({ message: 'Video uploaded successfully', videoId: result.id });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    try { fs.unlinkSync(imagePath); } catch {}
+    try { fs.unlinkSync(videoPath); } catch {}
+    res.json({ question: random.question, videoId });
+  } catch (error) {
+    console.error('Error in /make:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Endpoint to begin OAuth2 flow
+// Health check route
+app.get('/', (req, res) => {
+  res.send('Brain Bender Daily minimal API is running');
+});
+
+// OAuth routes for obtaining a new refresh token.  These are only
+// needed if you need to re-authorise the application.  The
+// authorised redirect URI must match the one configured in Google
+// Cloud.
 app.get('/auth', (req, res) => {
   const scopes = ['https://www.googleapis.com/auth/youtube.upload'];
-  const url = oauth2Client.generateAuthUrl({
+  const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
-    prompt: 'consent',
-    scope: scopes
+    scope: scopes,
+    prompt: 'consent'
   });
-  res.redirect(url);
+  res.redirect(authUrl);
 });
 
-// Endpoint to handle OAuth2 callback
 app.get('/oauth2callback', async (req, res) => {
-  const code = req.query.code;
-  if (!code) {
-    return res.status(400).send('Missing code parameter');
-  }
+  const { code } = req.query;
+  if (!code) return res.send('No code provided');
   try {
-    const { tokens } = await oauth2Client.getToken(code);
-    if (tokens.refresh_token) {
-      console.log('REFRESH_TOKEN:', tokens.refresh_token);
-    }
-    oauth2Client.setCredentials(tokens);
-    res.send('Authorization successful. Refresh token logged to server logs.');
-  } catch (err) {
-    console.error('Error exchanging code for tokens:', err);
-    res.status(500).send('Authentication error');
+    const { tokens } = await oauth2Client.getToken(String(code));
+    console.log('New tokens acquired:', tokens);
+    // Refresh token is logged; you must store it in YOUTUBE_REFRESH_TOKEN env
+    res.send('Tokens acquired. Check your server logs for the refresh token.');
+  } catch (error) {
+    console.error('Error exchanging code:', error);
+    res.status(500).send('Error retrieving access token');
   }
-});
-
-// Basic health check
-app.get('/', (req, res) => {
-  res.send('Brain Bender Daily API is running.');
 });
 
 app.listen(port, () => {

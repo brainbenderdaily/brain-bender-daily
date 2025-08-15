@@ -1,16 +1,15 @@
 {
-  "name": "brain-bender-daily",
+  "name": "brain-bender-daily-minimal",
   "version": "1.0.0",
+  "description": "Minimal API for generating riddle videos and uploading to YouTube.",
   "main": "index.js",
-  "license": "MIT",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "googleapis": "^125.0.0",
-    "fluent-ffmpeg": "^2.1.2",
-    "ffmpeg-static": "^4.4.0",
-    "jimp": "^0.16.1"
+    "googleapis": "^121.0.0",
+    "jimp": "^0.22.10",
+    "ffmpeg-static": "^5.1.0"
   }
 }
