@@ -5,32 +5,28 @@ const { google } = require('googleapis');
 const Jimp = require('jimp');
 const axios = require('axios');
 const googleTTS = require('google-tts-api');
+const cron = require('node-cron');
 const { execFile } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
-const cron = require('node-cron');
 
 /*
- * Brain Bender Daily – Cron‑enabled API
+ * Brain Bender Daily – Voice and Animation
  *
- * This implementation expands on the minimal server by adding
- * narration and a built‑in scheduler.  It converts a riddle into
- * an image using Jimp, synthesises speech via the free
- * google‑tts‑api package, combines them into a short video with
- * ffmpeg and uploads the result to YouTube.  A cron job runs the
- * generation three times per day (09:00, 15:00 and 21:00 UTC) so
- * you can keep your channel populated without any external
- * automation service.  Use environment variables for OAuth and
- * refresh tokens as described in the README.  Health check and
- * OAuth routes are provided for diagnostics and re‑authorisation.
+ * This server builds on the cron implementation by adding a
+ * narration soundtrack and simple fade animations.  After
+ * selecting a random riddle, it renders a 640×640 image with
+ * both the question and answer, synthesises voice via
+ * google-tts-api, and uses ffmpeg to merge the two into a 20
+ * second MP4.  Fade‑in and fade‑out effects are applied to the
+ * video, and the audio drives the duration.  A built‑in cron
+ * schedule triggers generation three times daily.  The YouTube
+ * upload uses a refresh token for authentication.
  */
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// OAuth2 configuration.  The client ID, client secret and
-// refresh token must be set in the environment.  Optionally, the
-// redirect URI can be customised via REDIRECT_URI.  See the
-// README for instructions on obtaining these values.
+// OAuth configuration
 const CLIENT_ID = process.env.YOUTUBE_CLIENT_ID;
 const CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET;
 const REDIRECT_URI = process.env.REDIRECT_URI || 'https://brain-bender-daily.onrender.com/oauth2callback';
@@ -46,14 +42,7 @@ if (REFRESH_TOKEN) {
 }
 const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
 
-/**
- * Split text into an array of lines with a maximum number of
- * characters per line.  Ensures text wraps neatly on the image.
- *
- * @param {string} text The full string to wrap
- * @param {number} maxChars Maximum characters per line
- * @returns {string[]} The wrapped lines
- */
+// Helper to wrap text for the image
 function wrapText(text, maxChars) {
   const words = text.split(/\s+/);
   const lines = [];
@@ -69,61 +58,40 @@ function wrapText(text, maxChars) {
   return lines;
 }
 
-/**
- * Generate an image containing the given text.  A square 640×640
- * canvas is used for Shorts, with the text centred.  The text
- * should include both question and answer.
- *
- * @param {string} text The question and answer combined
- * @param {string} outPath Output PNG path
- */
+// Create an image for the riddle
 async function generateImage(text, outPath) {
   const size = 640;
-  const bgColour = 0xffffffff; // white
-  const image = new Jimp(size, size, bgColour);
+  const img = new Jimp(size, size, 0xffffffff);
   const font = await Jimp.loadFont(Jimp.FONT_SANS_32_BLACK);
   const lines = wrapText(text, 40);
   const lineHeight = Jimp.measureTextHeight(font, 'A', size);
   const totalHeight = lines.length * lineHeight + (lines.length - 1) * 10;
   let y = (size - totalHeight) / 2;
-  lines.forEach(line => {
-    const textWidth = Jimp.measureText(font, line);
-    const x = (size - textWidth) / 2;
-    image.print(font, x, y, line);
+  for (const line of lines) {
+    const w = Jimp.measureText(font, line);
+    const x = (size - w) / 2;
+    img.print(font, x, y, line);
     y += lineHeight + 10;
-  });
-  await image.writeAsync(outPath);
+  }
+  await img.writeAsync(outPath);
 }
 
-/**
- * Synthesize speech for a riddle using the google-tts-api.  The
- * synthesised text includes both the question and the answer so
- * that viewers hear the solution at the end.  The returned file
- * path points to a temporary MP3 on disk.  Temporary files are
- * overwritten each time.
- *
- * @param {{question: string, answer: string}} riddle
- * @returns {Promise<string>} Absolute path to the saved MP3 file
- */
+// Generate speech using google-tts-api.  The voice includes both
+// question and answer.  A temporary MP3 is returned.
 async function generateVoice(riddle) {
   const phrase = `${riddle.question}. Answer: ${riddle.answer}.`;
-  const url = await googleTTS.getAudioUrl(phrase, { lang: 'en', slow: false, host: 'https://translate.google.com' });
+  const url = await googleTTS.getAudioUrl(phrase, {
+    lang: 'en',
+    slow: false,
+    host: 'https://translate.google.com'
+  });
   const response = await axios.get(url, { responseType: 'arraybuffer' });
   const voicePath = path.join(__dirname, 'voice.mp3');
   fs.writeFileSync(voicePath, Buffer.from(response.data));
   return voicePath;
 }
 
-/**
- * Use ffmpeg to merge a still image and an audio track into a
- * short video.  The video will end when the audio ends.  Both
- * inputs are assumed to be local files.  Temporary output files
- * are overwritten on each call.
- *
- * @param {string} imagePath Path to PNG file
- * @param {string} audioPath Path to MP3 file
- * @param {string} outPath Path to save MP4 file
- */
+// Merge image and audio with simple fade animations
 function generateVideo(imagePath, audioPath, outPath) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -131,10 +99,15 @@ function generateVideo(imagePath, audioPath, outPath) {
       '-loop', '1',
       '-i', imagePath,
       '-i', audioPath,
+      '-filter_complex',
+      // Apply fade in and fade out on the video stream
+      // fade=in at 0 for 1 second, fade=out at t=end-1 for 1 second
+      "[0:v]format=yuv420p,fade=t=in:st=0:d=1,fade=t=out:st=19:d=1[v]",
+      '-map', '[v]',
+      '-map', '1:a',
       '-c:v', 'libx264',
       '-c:a', 'aac',
       '-shortest',
-      '-pix_fmt', 'yuv420p',
       outPath
     ];
     execFile(ffmpegPath, args, (err) => {
@@ -144,25 +117,13 @@ function generateVideo(imagePath, audioPath, outPath) {
   });
 }
 
-/**
- * Upload a video to YouTube.  The video is uploaded as private.
- * Returns the YouTube video ID on success.
- *
- * @param {string} videoPath MP4 file
- * @param {string} title Video title
- * @param {string} description Video description
- */
+// Upload to YouTube
 async function uploadVideo(videoPath, title, description) {
   const response = await youtube.videos.insert({
     part: ['snippet', 'status'],
     requestBody: {
-      snippet: {
-        title,
-        description
-      },
-      status: {
-        privacyStatus: 'private'
-      }
+      snippet: { title, description },
+      status: { privacyStatus: 'private' }
     },
     media: {
       mimeType: 'video/mp4',
@@ -172,57 +133,46 @@ async function uploadVideo(videoPath, title, description) {
   return response.data.id;
 }
 
-/**
- * Main function to generate and upload a riddle video.  This
- * function is used both by the /make endpoint and the cron job.
- * It reads all riddles, picks one randomly, synthesises the
- * assets, uploads the result and cleans up temporary files.
- *
- * @returns {Promise<{question: string, videoId: string}>}
- */
+// Core function to create and upload a video
 async function createAndUpload() {
   const riddles = JSON.parse(
     fs.readFileSync(path.join(__dirname, 'data', 'riddles.json'), 'utf8')
   );
   const random = riddles[Math.floor(Math.random() * riddles.length)];
   const combinedText = `${random.question}\n\nAnswer: ${random.answer}`;
-  const imagePath = path.join(__dirname, 'temp.png');
+  const imagePath = path.join(__dirname, 'frame.png');
   const audioPath = await generateVoice(random);
-  const videoPath = path.join(__dirname, 'output.mp4');
+  const videoPath = path.join(__dirname, 'video.mp4');
   await generateImage(combinedText, imagePath);
   await generateVideo(imagePath, audioPath, videoPath);
   const videoId = await uploadVideo(videoPath, random.question, random.answer);
-  // Clean up temporary files
+  // Clean up
   try { fs.unlinkSync(imagePath); } catch {}
   try { fs.unlinkSync(audioPath); } catch {}
   try { fs.unlinkSync(videoPath); } catch {}
   return { question: random.question, videoId };
 }
 
-// HTTP endpoint to generate and upload a single video on demand
+// HTTP endpoint for ad hoc generation
 app.get('/make', async (req, res) => {
   try {
     const result = await createAndUpload();
     res.json(result);
   } catch (err) {
-    console.error('Error generating video:', err);
+    console.error('Generation error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Basic health check
+// Health endpoint
 app.get('/', (req, res) => {
-  res.send('Brain Bender Daily cron API is running');
+  res.send('Brain Bender Daily voice+anim API is running');
 });
 
-// OAuth helper routes
+// OAuth routes
 app.get('/auth', (req, res) => {
   const scopes = ['https://www.googleapis.com/auth/youtube.upload'];
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: scopes,
-    prompt: 'consent'
-  });
+  const url = oauth2Client.generateAuthUrl({ access_type: 'offline', scope: scopes, prompt: 'consent' });
   res.redirect(url);
 });
 
@@ -232,24 +182,24 @@ app.get('/oauth2callback', async (req, res) => {
   try {
     const { tokens } = await oauth2Client.getToken(code);
     console.log('New refresh token:', tokens.refresh_token);
-    res.send('Authorization successful.  Check logs for refresh token.');
+    res.send('Authorised successfully.  Check logs for refresh token.');
   } catch (err) {
-    console.error('OAuth callback error:', err);
-    res.status(500).send('OAuth error');
+    console.error('OAuth error:', err);
+    res.status(500).send('OAuth failure');
   }
 });
 
-// Schedule automatic generation at 09:00, 15:00 and 21:00 UTC daily
+// Schedule generation at 9, 15, 21 UTC daily
 cron.schedule('0 9,15,21 * * *', async () => {
-  console.log('Cron job: generating daily video');
+  console.log('Scheduled job: creating video...');
   try {
     const result = await createAndUpload();
-    console.log('Cron job uploaded video:', result.videoId);
+    console.log('Scheduled upload:', result.videoId);
   } catch (err) {
-    console.error('Cron job error:', err);
+    console.error('Scheduled job failed:', err);
   }
 }, { timezone: 'UTC' });
 
 app.listen(port, () => {
-  console.log(`Server listening on port ${port}`);
+  console.log(`Server running on port ${port}`);
 });

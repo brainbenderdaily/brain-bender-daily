@@ -1,7 +1,7 @@
 {
-  "name": "brain-bender-daily-cron",
+  "name": "brain-bender-daily-voice-anim",
   "version": "1.0.0",
-  "description": "Automated riddle video generator with cron and voice-overs",
+  "description": "Automated riddle generator with voice-overs and fade animations",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,10 +9,10 @@
   "dependencies": {
     "axios": "^1.6.0",
     "express": "^4.18.2",
+    "ffmpeg-static": "^5.0.1",
     "google-tts-api": "^2.0.1",
     "googleapis": "^125.0.0",
     "jimp": "^0.22.10",
-    "node-cron": "^3.0.2",
-    "ffmpeg-static": "^5.0.1"
+    "node-cron": "^3.0.2"
   }
 }
