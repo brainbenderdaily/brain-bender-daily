@@ -1,126 +1,144 @@
-// ===== Core deps
-const express = require('express');
-const fs = require('fs');
-const path = require('path');
-const { google } = require('googleapis');
+// =========================
+// Brain Bender Daily - Server
+// One-file drop-in (copy/paste)
+// =========================
+
+const express     = require('express');
+const fs          = require('fs');
+const path        = require('path');
+const { google }  = require('googleapis');
 const { getAudioUrl } = require('google-tts-api');
-const fetch = require('node-fetch');
+const fetch       = require('node-fetch');
 const { spawnSync } = require('child_process');
-const ffmpegPath = require('ffmpeg-static');
-const cron = require('node-cron');
+const ffmpegPath  = require('ffmpeg-static');
 
-// ===== Project info (comment only)
-// Brain Bender Daily – automated Shorts creator
-// - Generates a voiced vertical short with animated text overlays
-// - Uploads to YouTube as PRIVATE
-// - /make endpoint triggers a one-off generation
-// - Cron (3x/day) can be enabled if desired
+// -------------------------
+// ENV
+// -------------------------
+const PORT          = process.env.PORT || 3000;
+const CLIENT_ID     = process.env.YOUTUBE_CLIENT_ID;
+const CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET;
+const REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN;
+const REDIRECT_URI  = process.env.REDIRECT_URI || `https://${process.env.RENDER_INTERNAL_HOSTNAME || 'localhost'}/oauth2callback`;
 
-// ===== Env
-const PORT           = process.env.PORT || 3000;
-const CLIENT_ID      = process.env.YOUTUBE_CLIENT_ID;
-const CLIENT_SECRET  = process.env.YOUTUBE_CLIENT_SECRET;
-const REFRESH_TOKEN  = process.env.YOUTUBE_REFRESH_TOKEN;
-const REDIRECT_URI   = process.env.REDIRECT_URI || `https://${process.env.RENDER_INTERNAL_HOSTNAME || 'localhost'}/oauth2callback`;
+// -------------------------
+// OAuth + YouTube
+// -------------------------
+const oauth2 = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+oauth2.setCredentials({ refresh_token: REFRESH_TOKEN });
+const youtube = google.youtube({ version: 'v3', auth: oauth2 });
 
-// ===== OAuth client
-const oauth2client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
-oauth2client.setCredentials({ refresh_token: REFRESH_TOKEN });
-const youtube = google.youtube({ version: 'v3', auth: oauth2client });
+// -------------------------
+// Paths
+// -------------------------
+const APP_ROOT   = process.cwd();
+const DATA_DIR   = path.join(APP_ROOT, 'data');
+const ASSETS_DIR = path.join(APP_ROOT, 'assets');
+const FONT_PATH  = path.join(ASSETS_DIR, 'BebasNeue-Regular.ttf'); // <-- you uploaded this
 
-// ===== Paths
-const appRoot  = process.cwd();
-const dataDir  = path.join(appRoot, 'data');
-const assetsDir= path.join(appRoot, 'assets');
+// Startup sanity logs (show in Render Logs)
+try {
+  console.log('FONT_PATH:', FONT_PATH, 'exists:', fs.existsSync(FONT_PATH));
+  if (fs.existsSync(ASSETS_DIR)) {
+    console.log('Assets dir contents:', fs.readdirSync(ASSETS_DIR));
+  }
+} catch (e) {
+  console.log('Startup check error:', e.message);
+}
 
-// ===== FONT (you uploaded this file)
-const FONT_PATH = path.join(assetsDir, 'BebasNeue-Regular.ttf');
-
-// ===== Helpers (safe text for drawtext)
+// -------------------------
+// Helpers
+// -------------------------
 function escText(s) {
   return String(s)
     .replace(/\\/g, '\\\\')   // backslashes
-    .replace(/:/g, '\\:')     // colons
+    .replace(/:/g, '\\:')     // colons (drawtext separators)
     .replace(/'/g, "\\\\'");  // single quotes
 }
 
-// Build a drawtext string with outline + time window
 function dt(text, { x="(w-text_w)/2", y="(h-text_h)/2", size=56, color="white",
                     start=0, end=3, border=4, borderColor="black@0.9" } = {}) {
   const t = escText(text);
   return `drawtext=fontfile='${FONT_PATH}':text='${t}':fontcolor=${color}:fontsize=${size}:x=${x}:y=${y}:borderw=${border}:bordercolor=${borderColor}:enable='between(t,${start},${end})'`;
 }
 
-// Pick a background image or use a solid color
-function pickBackgroundOrSolid() {
+function pickBackground() {
   try {
-    if (fs.existsSync(assetsDir)) {
-      const files = fs.readdirSync(assetsDir)
+    if (fs.existsSync(ASSETS_DIR)) {
+      const imgs = fs.readdirSync(ASSETS_DIR)
         .filter(f => /^background.*\.(png|jpg|jpeg)$/i.test(f));
-      if (files.length) {
-        const chosen = files[Math.floor(Math.random() * files.length)];
-        return { type: 'image', path: path.join(assetsDir, chosen) };
+      if (imgs.length) {
+        const chosen = imgs[Math.floor(Math.random() * imgs.length)];
+        return { kind: 'image', path: path.join(ASSETS_DIR, chosen) };
       }
     }
   } catch (_) {}
-  // solid color fallback (lavfi)
-  return { type: 'solid', color: '0x101020' }; // deep blue
+  return { kind: 'solid', color: '0x101020' }; // deep blue fallback
 }
 
-// Load a random riddle
 function loadRiddle() {
-  const file = path.join(dataDir, 'riddles.json');
+  const file = path.join(DATA_DIR, 'riddles.json');
   const list = JSON.parse(fs.readFileSync(file, 'utf8'));
   return list[Math.floor(Math.random() * list.length)];
 }
 
-// Download a URL to a file
 async function downloadToFile(url, outPath) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`download failed: ${res.status}`);
-  const buf = await res.buffer();
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`download failed: ${r.status}`);
+  const buf = await r.buffer();
   fs.writeFileSync(outPath, buf);
   return outPath;
 }
 
-// Build voiced audio (question + short pause + answer)
+// -------------------------
+// Audio build (TTS)
+// -------------------------
 async function buildVoiceTrack(question, answer) {
-  const tmpDir = path.join(appRoot, 'tmp');
-  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
-  const qUrl = getAudioUrl(question, { lang: 'en', slow: false, host: 'https://translate.google.com' });
+  const tmp = path.join(APP_ROOT, 'tmp');
+  if (!fs.existsSync(tmp)) fs.mkdirSync(tmp);
+
+  const qUrl = getAudioUrl(question,            { lang: 'en', slow: false, host: 'https://translate.google.com' });
   const aUrl = getAudioUrl(`Answer: ${answer}`, { lang: 'en', slow: false, host: 'https://translate.google.com' });
 
-  const qMp3 = path.join(tmpDir, `q_${Date.now()}.mp3`);
-  const pad  = path.join(tmpDir, `pad_${Date.now()}.mp3`); // 1s silence
-  const aMp3 = path.join(tmpDir, `a_${Date.now()}.mp3`);
-  const out  = path.join(tmpDir, `speech_${Date.now()}.mp3`);
+  const qMp3 = path.join(tmp, `q_${Date.now()}.mp3`);
+  const aMp3 = path.join(tmp, `a_${Date.now()}.mp3`);
+  const pad  = path.join(tmp, `pad_${Date.now()}.mp3`);
+  const out  = path.join(tmp, `speech_${Date.now()}.mp3`);
 
   await downloadToFile(qUrl, qMp3);
-  // make 1s silent mp3
-  let args = ['-f','lavfi','-i','anullsrc=r=24000:cl=mono','-t','1','-q:a','9','-acodec','libmp3lame', pad];
-  let p = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
-  if (p.status !== 0) { throw new Error(`ffmpeg(silence) failed: ${p.stderr}`); }
-
   await downloadToFile(aUrl, aMp3);
 
+  // 1s silence
+  let args = ['-f','lavfi','-i','anullsrc=r=24000:cl=mono','-t','1','-q:a','9','-acodec','libmp3lame', pad];
+  let p = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
+  if (p.status !== 0) {
+    const msg = `ffmpeg(silence) failed\nARGS: ${args.join(' ')}\nSTDERR: ${p.stderr}`;
+    console.error(msg); throw new Error(msg);
+  }
+
   // concat q + pad + a
-  const listFile = path.join(tmpDir, `list_${Date.now()}.txt`);
+  const listFile = path.join(tmp, `list_${Date.now()}.txt`);
   fs.writeFileSync(listFile, `file '${qMp3}'\nfile '${pad}'\nfile '${aMp3}'\n`);
-  args = ['-f','concat','-safe','0','-i',listFile,'-c','copy',out];
+  args = ['-f','concat','-safe','0','-i', listFile, '-c','copy', out];
   p = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
-  if (p.status !== 0) { throw new Error(`ffmpeg(concat) failed: ${p.stderr}`); }
+  if (p.status !== 0) {
+    const msg = `ffmpeg(concat) failed\nARGS: ${args.join(' ')}\nSTDERR: ${p.stderr}`;
+    console.error(msg); throw new Error(msg);
+  }
 
   return out;
 }
 
-// Create video with overlays
+// -------------------------
+// Video build (ffmpeg)
+// -------------------------
 async function createVideo(question, answer, audioPath) {
-  const bg = pickBackgroundOrSolid();
-  const tmpDir = path.join(appRoot, 'tmp');
-  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
-  const out = path.join(tmpDir, `out_${Date.now()}.mp4`);
+  const bg = pickBackground();
+  const tmp = path.join(APP_ROOT, 'tmp');
+  if (!fs.existsSync(tmp)) fs.mkdirSync(tmp);
+  const out = path.join(tmp, `out_${Date.now()}.mp4`);
 
-  // base filters
+  // Filter chain (clean, safe)
   const filters = [
     'scale=1080:1920:flags=lanczos,format=yuv420p',
     dt("Today's Riddle",           { size: 68, y: 'h*0.15', start: 0, end: 2 }),
@@ -132,76 +150,78 @@ async function createVideo(question, answer, audioPath) {
     dt('Follow @BrainBenderDaily', { size: 44, y: 'h*0.92', start: 0, end: 11, color: 'white', border: 3 }),
   ].join(',');
 
-  // Build ffmpeg args
+  // Build args
   let args = [];
-  if (bg.type === 'image') {
-    // loop image for 11s
+  if (bg.kind === 'image') {
     args.push('-loop','1','-i', bg.path);
   } else {
-    // solid color background
     args.push('-f','lavfi','-i', `color=c=${bg.color}:s=1080x1920:r=30`);
   }
   args.push('-i', audioPath);
 
-  // duration 11s, h264, aac
   args.push(
     '-t','11',
     '-r','30',
     '-vf', filters,
     '-c:v','libx264','-preset','veryfast','-crf','22',
     '-c:a','aac','-b:a','128k',
+    '-movflags','+faststart',
     '-shortest',
     out
   );
 
   const proc = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
   if (proc.status !== 0) {
-    console.error('FFmpeg args:', args.join(' '));
-    console.error('FFmpeg stdout:', proc.stdout);
-    console.error('FFmpeg stderr:', proc.stderr);
-    throw new Error('ffmpeg failed');
+    const msg = [
+      'ffmpeg failed',
+      'ARGS: '   + args.join(' '),
+      'STDERR: ' + (proc.stderr || '(empty)'),
+      'STDOUT: ' + (proc.stdout || '(empty)'),
+    ].join('\n');
+    console.error(msg);
+    throw new Error(msg);
   }
+
   return out;
 }
 
-// Upload to YouTube
+// -------------------------
+// Upload to YouTube (private)
+// -------------------------
 async function uploadToYouTube(filePath, title, description) {
-  const stats = fs.statSync(filePath);
+  const size = fs.statSync(filePath).size;
   const res = await youtube.videos.insert({
     part: ['snippet','status'],
     requestBody: {
-      snippet: { title, description, categoryId: '27' }, // Education
-      status: { privacyStatus: 'private' }
+      snippet: { title, description, categoryId: '27' }, // 27 = Education
+      status:  { privacyStatus: 'private' }
     },
     media: { body: fs.createReadStream(filePath), mimeType: 'video/mp4' },
-  }, {
-    maxContentLength: stats.size,
-    maxBodyLength:  Infinity,
-  });
+  }, { maxContentLength: size, maxBodyLength: Infinity });
+
   return res.data.id;
 }
 
-// Express app
+// -------------------------
+// Express
+// -------------------------
 const app = express();
 
-app.get('/', (_, res) => {
-  res.json({ ok: true, hint: 'Use /make to generate a short.' });
-});
+app.get('/', (_, res) => res.json({ ok: true, hint: 'Call /make to generate a Short.' }));
 
 app.get('/make', async (req, res) => {
   try {
     const { question, answer } = loadRiddle();
-    const audio = await buildVoiceTrack(question, answer);
-    const vid   = await createVideo(question, answer, audio);
+    const speech = await buildVoiceTrack(question, answer);
+    const video  = await createVideo(question, answer, speech);
+
     const title = question.length > 90 ? question.slice(0, 90) + '…' : question;
     const desc  = `${question}\nAnswer: ${answer}\n#riddle #brainteaser #shorts`;
-    const videoId = await uploadToYouTube(vid, title, desc);
 
-    // cleanup temp media (non-fatal if fails)
-    try {
-      fs.unlinkSync(vid);
-      fs.unlinkSync(audio);
-    } catch (_) {}
+    const videoId = await uploadToYouTube(video, title, desc);
+
+    // Best-effort cleanup
+    try { fs.unlinkSync(video); fs.unlinkSync(speech); } catch (_) {}
 
     res.json({ question, answer, videoId });
   } catch (e) {
@@ -210,16 +230,10 @@ app.get('/make', async (req, res) => {
   }
 });
 
-// OPTIONAL: cron – uncomment to enable 3x/day
-// cron.schedule('0 9,15,21 * * *', async () => {
-//   try {
-//     const r = await fetch(`http://localhost:${PORT}/make`);
-//     console.log('Cron /make status:', r.status);
-//   } catch (e) {
-//     console.error('Cron error:', e);
-//   }
+// (Optional) Cron – enable if you want autoposting 3x/day
+// const LOCAL = `http://localhost:${PORT}/make`;
+// require('node-cron').schedule('0 9,15,21 * * *', async () => {
+//   try { const r = await fetch(LOCAL); console.log('Cron /make', r.status); } catch (e) { console.error('Cron error', e.message); }
 // });
 
-app.listen(PORT, () => {
-  console.log(`Server on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`Brain Bender Daily running on :${PORT}`));
