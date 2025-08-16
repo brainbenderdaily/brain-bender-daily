@@ -1,3 +1,4 @@
+// ===== Core deps
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -8,248 +9,217 @@ const { spawnSync } = require('child_process');
 const ffmpegPath = require('ffmpeg-static');
 const cron = require('node-cron');
 
-/*
- * Brain Bender Daily automated content creator
- *
- * This script uses only free/open‑source libraries to generate engaging
- * YouTube Shorts. It synthesizes a voice‑over with Google TTS, overlays
- * multiple lines of text with countdown timers on top of a random
- * background and mixes the audio with the footage via ffmpeg. The
- * resulting video is uploaded privately to the configured channel via
- * the YouTube Data API. A built‑in cron job runs three times per day
- * to keep the channel active without human intervention.
- */
+// ===== Project info (comment only)
+// Brain Bender Daily – automated Shorts creator
+// - Generates a voiced vertical short with animated text overlays
+// - Uploads to YouTube as PRIVATE
+// - /make endpoint triggers a one-off generation
+// - Cron (3x/day) can be enabled if desired
 
-// Load environment variables
-const PORT = process.env.PORT || 3000;
-const CLIENT_ID = process.env.YOUTUBE_CLIENT_ID;
-const CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET;
-const REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN;
-const REDIRECT_URI = process.env.REDIRECT_URI || `https://${process.env.RENDER_INTERNAL_HOSTNAME || 'localhost'}/oauth2callback`;
+// ===== Env
+const PORT           = process.env.PORT || 3000;
+const CLIENT_ID      = process.env.YOUTUBE_CLIENT_ID;
+const CLIENT_SECRET  = process.env.YOUTUBE_CLIENT_SECRET;
+const REFRESH_TOKEN  = process.env.YOUTUBE_REFRESH_TOKEN;
+const REDIRECT_URI   = process.env.REDIRECT_URI || `https://${process.env.RENDER_INTERNAL_HOSTNAME || 'localhost'}/oauth2callback`;
 
-// OAuth2 client for YouTube API
-const oauth2Client = new google.auth.OAuth2(
-  CLIENT_ID,
-  CLIENT_SECRET,
-  REDIRECT_URI
-);
-if (REFRESH_TOKEN) {
-  oauth2Client.setCredentials({ refresh_token: REFRESH_TOKEN });
+// ===== OAuth client
+const oauth2client = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+oauth2client.setCredentials({ refresh_token: REFRESH_TOKEN });
+const youtube = google.youtube({ version: 'v3', auth: oauth2client });
+
+// ===== Paths
+const appRoot  = process.cwd();
+const dataDir  = path.join(appRoot, 'data');
+const assetsDir= path.join(appRoot, 'assets');
+
+// ===== FONT (you uploaded this file)
+const FONT_PATH = path.join(assetsDir, 'BebasNeue-Regular.ttf');
+
+// ===== Helpers (safe text for drawtext)
+function escText(s) {
+  return String(s)
+    .replace(/\\/g, '\\\\')   // backslashes
+    .replace(/:/g, '\\:')     // colons
+    .replace(/'/g, "\\\\'");  // single quotes
 }
 
-const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-
-const app = express();
-app.use(express.json());
-
-/**
- * Choose a random riddle from the data file.
- */
-function getRandomRiddle() {
-  const riddles = JSON.parse(
-    fs.readFileSync(path.join(__dirname, 'data', 'riddles.json'), 'utf8')
-  );
-  return riddles[Math.floor(Math.random() * riddles.length)];
+// Build a drawtext string with outline + time window
+function dt(text, { x="(w-text_w)/2", y="(h-text_h)/2", size=56, color="white",
+                    start=0, end=3, border=4, borderColor="black@0.9" } = {}) {
+  const t = escText(text);
+  return `drawtext=fontfile='${FONT_PATH}':text='${t}':fontcolor=${color}:fontsize=${size}:x=${x}:y=${y}:borderw=${border}:bordercolor=${borderColor}:enable='between(t,${start},${end})'`;
 }
 
-/**
- * Select a random background image from the assets folder. If none exist, return
- * a solid colour background (white).
- */
-function getRandomBackground() {
-  const assetsDir = path.join(__dirname, 'assets');
-  const files = fs.readdirSync(assetsDir).filter((f) => /\.(png|jpe?g)$/i.test(f));
-  if (files.length === 0) {
-    return null;
-  }
-  return path.join(assetsDir, files[Math.floor(Math.random() * files.length)]);
+// Pick a background image or use a solid color
+function pickBackgroundOrSolid() {
+  try {
+    if (fs.existsSync(assetsDir)) {
+      const files = fs.readdirSync(assetsDir)
+        .filter(f => /^background.*\.(png|jpg|jpeg)$/i.test(f));
+      if (files.length) {
+        const chosen = files[Math.floor(Math.random() * files.length)];
+        return { type: 'image', path: path.join(assetsDir, chosen) };
+      }
+    }
+  } catch (_) {}
+  // solid color fallback (lavfi)
+  return { type: 'solid', color: '0x101020' }; // deep blue
 }
 
-/**
- * Generate a temporary MP3 file for the narration using Google TTS. The
- * returned promise resolves with the path to the saved file.
- */
-async function generateSpeech(question, answer) {
-  // Combine the question and answer into one narration string. We leave a
-  // short pause by adding a period and a short phrase.
-  const narration = `${question} Answer: ${answer}`;
-  const url = await getAudioUrl(narration, {
-    lang: 'en',
-    slow: false,
-    host: 'https://translate.google.com',
-  });
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`Failed to fetch TTS audio: ${response.statusText}`);
-  }
-  const buffer = await response.buffer();
-  const tmpPath = path.join(__dirname, `speech_${Date.now()}.mp3`);
-  fs.writeFileSync(tmpPath, buffer);
-  return tmpPath;
+// Load a random riddle
+function loadRiddle() {
+  const file = path.join(dataDir, 'riddles.json');
+  const list = JSON.parse(fs.readFileSync(file, 'utf8'));
+  return list[Math.floor(Math.random() * list.length)];
 }
 
-/**
- * Create a video using ffmpeg with dynamic overlays. The video will be
- * vertical (1080x1920) and last ~16 seconds. It shows an intro slide,
- * the riddle question, a countdown, the answer, and a call‑to‑action.
- */
-function createVideo({ question, answer }, bgImage, audioFile, outputPath) {
-  // Escape single quotes and colons in text for ffmpeg drawtext filters.
-  const esc = (text) => text.replace(/'/g, "\\'").replace(/:/g, '\\:');
-  const questionText = esc(question);
-  const answerText = esc(`Answer: ${answer}`);
-  const callToAction = esc('Follow for daily brain benders!');
-  const introTitle = esc('Brain Bender Daily');
-  const subtitle = esc("Today's Riddle");
-  // Choose a font installed in the container; DejaVu Sans is widely available.
-  const font = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
-  // Build the ffmpeg filter_complex string. Each drawtext uses the enable
-  // expression to show during a specific time range.
-  const filter = [
-    // Intro (0–2s)
-    `drawtext=fontfile=${font}:text='${introTitle}':fontsize=72:fontcolor=white:x=(w-text_w)/2:y=h*0.3:enable='between(t,0,2)'`,
-    `drawtext=fontfile=${font}:text='${subtitle}':fontsize=40:fontcolor=white:x=(w-text_w)/2:y=h*0.4:enable='between(t,0,2)'`,
-    // Question (2–7s)
-    `drawtext=fontfile=${font}:text='${questionText}':fontsize=48:fontcolor=yellow:x=(w-text_w)/2:y=h*0.35:enable='between(t,2,7)'`,
-    `drawtext=fontfile=${font}:text='Think about it...':fontsize=32:fontcolor=white:x=(w-text_w)/2:y=h*0.45:enable='between(t,2,7)'`,
-    // Countdown (7–10s)
-    `drawtext=fontfile=${font}:text='Answer in 3':fontsize=64:fontcolor=red:x=(w-text_w)/2:y=h*0.5:enable='between(t,7,8)'`,
-    `drawtext=fontfile=${font}:text='Answer in 2':fontsize=64:fontcolor=red:x=(w-text_w)/2:y=h*0.5:enable='between(t,8,9)'`,
-    `drawtext=fontfile=${font}:text='Answer in 1':fontsize=64:fontcolor=red:x=(w-text_w)/2:y=h*0.5:enable='between(t,9,10)'`,
-    // Answer reveal (10–14s)
-    `drawtext=fontfile=${font}:text='${answerText}':fontsize=48:fontcolor=cyan:x=(w-text_w)/2:y=h*0.4:enable='between(t,10,14)'`,
-    `drawtext=fontfile=${font}:text='Did you get it right?':fontsize=32:fontcolor=white:x=(w-text_w)/2:y=h*0.5:enable='between(t,10,14)'`,
-    // Call to action (14–16s)
-    `drawtext=fontfile=${font}:text='${callToAction}':fontsize=36:fontcolor=white:x=(w-text_w)/2:y=h*0.45:enable='between(t,14,16)'`,
-    // Fade in/out
-    `fade=t=in:st=0:d=0.5`,
-    `fade=t=out:st=15.5:d=0.5`,
+// Download a URL to a file
+async function downloadToFile(url, outPath) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`download failed: ${res.status}`);
+  const buf = await res.buffer();
+  fs.writeFileSync(outPath, buf);
+  return outPath;
+}
+
+// Build voiced audio (question + short pause + answer)
+async function buildVoiceTrack(question, answer) {
+  const tmpDir = path.join(appRoot, 'tmp');
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
+  const qUrl = getAudioUrl(question, { lang: 'en', slow: false, host: 'https://translate.google.com' });
+  const aUrl = getAudioUrl(`Answer: ${answer}`, { lang: 'en', slow: false, host: 'https://translate.google.com' });
+
+  const qMp3 = path.join(tmpDir, `q_${Date.now()}.mp3`);
+  const pad  = path.join(tmpDir, `pad_${Date.now()}.mp3`); // 1s silence
+  const aMp3 = path.join(tmpDir, `a_${Date.now()}.mp3`);
+  const out  = path.join(tmpDir, `speech_${Date.now()}.mp3`);
+
+  await downloadToFile(qUrl, qMp3);
+  // make 1s silent mp3
+  let args = ['-f','lavfi','-i','anullsrc=r=24000:cl=mono','-t','1','-q:a','9','-acodec','libmp3lame', pad];
+  let p = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
+  if (p.status !== 0) { throw new Error(`ffmpeg(silence) failed: ${p.stderr}`); }
+
+  await downloadToFile(aUrl, aMp3);
+
+  // concat q + pad + a
+  const listFile = path.join(tmpDir, `list_${Date.now()}.txt`);
+  fs.writeFileSync(listFile, `file '${qMp3}'\nfile '${pad}'\nfile '${aMp3}'\n`);
+  args = ['-f','concat','-safe','0','-i',listFile,'-c','copy',out];
+  p = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
+  if (p.status !== 0) { throw new Error(`ffmpeg(concat) failed: ${p.stderr}`); }
+
+  return out;
+}
+
+// Create video with overlays
+async function createVideo(question, answer, audioPath) {
+  const bg = pickBackgroundOrSolid();
+  const tmpDir = path.join(appRoot, 'tmp');
+  if (!fs.existsSync(tmpDir)) fs.mkdirSync(tmpDir);
+  const out = path.join(tmpDir, `out_${Date.now()}.mp4`);
+
+  // base filters
+  const filters = [
+    'scale=1080:1920:flags=lanczos,format=yuv420p',
+    dt("Today's Riddle",           { size: 68, y: 'h*0.15', start: 0, end: 2 }),
+    dt(question,                   { size: 58, y: 'h*0.40', start: 0, end: 6 }),
+    dt('Answer in 3…',             { size: 60, y: 'h*0.78', start: 2, end: 3, color: 'yellow' }),
+    dt('Answer in 2…',             { size: 60, y: 'h*0.78', start: 3, end: 4, color: 'yellow' }),
+    dt('Answer in 1…',             { size: 60, y: 'h*0.78', start: 4, end: 5, color: 'yellow' }),
+    dt(`Answer: ${answer}`,        { size: 66, y: 'h*0.40', start: 5, end: 11, color: 'cyan' }),
+    dt('Follow @BrainBenderDaily', { size: 44, y: 'h*0.92', start: 0, end: 11, color: 'white', border: 3 }),
   ].join(',');
-  // Build arguments
-  const args = [
-    '-y',
-    '-loop', '1',
-    '-i', bgImage || path.join(__dirname, 'assets', 'bg.png'),
-    '-i', audioFile,
-    '-t', '16', // total duration (sec)
-    '-vf', filter,
-    '-s', '1080x1920',
-    '-c:v', 'libx264',
-    '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac',
-    '-shortest',
-    outputPath,
-  ];
-  const result = spawnSync(ffmpegPath, args, { stdio: 'inherit' });
-  if (result.status !== 0) {
-    throw new Error(`ffmpeg failed with code ${result.status}`);
+
+  // Build ffmpeg args
+  let args = [];
+  if (bg.type === 'image') {
+    // loop image for 11s
+    args.push('-loop','1','-i', bg.path);
+  } else {
+    // solid color background
+    args.push('-f','lavfi','-i', `color=c=${bg.color}:s=1080x1920:r=30`);
   }
+  args.push('-i', audioPath);
+
+  // duration 11s, h264, aac
+  args.push(
+    '-t','11',
+    '-r','30',
+    '-vf', filters,
+    '-c:v','libx264','-preset','veryfast','-crf','22',
+    '-c:a','aac','-b:a','128k',
+    '-shortest',
+    out
+  );
+
+  const proc = spawnSync(ffmpegPath, args, { encoding: 'utf8' });
+  if (proc.status !== 0) {
+    console.error('FFmpeg args:', args.join(' '));
+    console.error('FFmpeg stdout:', proc.stdout);
+    console.error('FFmpeg stderr:', proc.stderr);
+    throw new Error('ffmpeg failed');
+  }
+  return out;
 }
 
-/**
- * Upload a local video to YouTube as a private short.
- */
-async function uploadToYouTube(videoPath, title, description) {
-  const fileSize = fs.statSync(videoPath).size;
+// Upload to YouTube
+async function uploadToYouTube(filePath, title, description) {
+  const stats = fs.statSync(filePath);
   const res = await youtube.videos.insert({
-    part: ['snippet', 'status'],
-    notifySubscribers: false,
+    part: ['snippet','status'],
     requestBody: {
-      snippet: {
-        title,
-        description,
-        categoryId: '24', // categoryId 24 = Entertainment
-      },
-      status: {
-        privacyStatus: 'private',
-        selfDeclaredMadeForKids: false,
-      },
+      snippet: { title, description, categoryId: '27' }, // Education
+      status: { privacyStatus: 'private' }
     },
-    media: {
-      body: fs.createReadStream(videoPath),
-    },
+    media: { body: fs.createReadStream(filePath), mimeType: 'video/mp4' },
   }, {
-    // Use the onUploadProgress event to log progress
-    onUploadProgress: (evt) => {
-      const progress = (evt.bytesRead / fileSize) * 100;
-      process.stdout.write(`Uploading to YouTube: ${progress.toFixed(2)}%\r`);
-    },
+    maxContentLength: stats.size,
+    maxBodyLength:  Infinity,
   });
   return res.data.id;
 }
 
-/**
- * Orchestrate the entire video creation and upload process.
- */
-async function handleRequest() {
-  const riddle = getRandomRiddle();
-  // Generate speech
-  const audioPath = await generateSpeech(riddle.question, riddle.answer);
-  // Choose a background (fallback to default if null)
-  const bgPath = getRandomBackground() || path.join(__dirname, 'assets', 'bg.png');
-  // Output video
-  const videoPath = path.join(__dirname, `video_${Date.now()}.mp4`);
-  try {
-    createVideo(riddle, bgPath, audioPath, videoPath);
-    const title = riddle.question;
-    const description = `${riddle.question} ${riddle.answer} #shorts #riddle`;
-    const videoId = await uploadToYouTube(videoPath, title, description);
-    return { question: riddle.question, answer: riddle.answer, videoId };
-  } finally {
-    // Clean up temporary files
-    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
-    if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
-  }
-}
+// Express app
+const app = express();
 
-// Routes
-app.get('/', (req, res) => {
-  res.send('Brain Bender Daily API is running.');
+app.get('/', (_, res) => {
+  res.json({ ok: true, hint: 'Use /make to generate a short.' });
 });
 
 app.get('/make', async (req, res) => {
   try {
-    const result = await handleRequest();
-    res.json(result);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: err.message });
+    const { question, answer } = loadRiddle();
+    const audio = await buildVoiceTrack(question, answer);
+    const vid   = await createVideo(question, answer, audio);
+    const title = question.length > 90 ? question.slice(0, 90) + '…' : question;
+    const desc  = `${question}\nAnswer: ${answer}\n#riddle #brainteaser #shorts`;
+    const videoId = await uploadToYouTube(vid, title, desc);
+
+    // cleanup temp media (non-fatal if fails)
+    try {
+      fs.unlinkSync(vid);
+      fs.unlinkSync(audio);
+    } catch (_) {}
+
+    res.json({ question, answer, videoId });
+  } catch (e) {
+    console.error('Error in /make:', e && e.stack || e);
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
-// OAuth route to initiate YouTube auth if needed
-app.get('/auth', (req, res) => {
-  const scopes = ['https://www.googleapis.com/auth/youtube.upload'];
-  const authUrl = oauth2Client.generateAuthUrl({ access_type: 'offline', scope: scopes });
-  res.redirect(authUrl);
-});
-
-// OAuth callback route
-app.get('/oauth2callback', async (req, res) => {
-  const code = req.query.code;
-  if (!code) return res.status(400).send('Missing code');
-  try {
-    const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
-    console.log('REFRESH_TOKEN:', tokens.refresh_token);
-    res.send('Authorization successful! You can close this window.');
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Authentication failed');
-  }
-});
-
-// Cron schedule: run 3 times per day at 09:00, 15:00, and 21:00 UTC
-cron.schedule('0 9,15,21 * * *', async () => {
-  console.log('Cron: creating scheduled short...');
-  try {
-    const result = await handleRequest();
-    console.log('Scheduled video created:', result.videoId);
-  } catch (err) {
-    console.error('Scheduled run failed:', err);
-  }
-});
+// OPTIONAL: cron – uncomment to enable 3x/day
+// cron.schedule('0 9,15,21 * * *', async () => {
+//   try {
+//     const r = await fetch(`http://localhost:${PORT}/make`);
+//     console.log('Cron /make status:', r.status);
+//   } catch (e) {
+//     console.error('Cron error:', e);
+//   }
+// });
 
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Server on :${PORT}`);
 });
