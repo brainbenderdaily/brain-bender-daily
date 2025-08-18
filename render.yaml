@@ -2,11 +2,18 @@ services:
   - type: web
     name: brain-bender-daily
     env: node
-    plan: free
-    buildCommand: npm install
-    startCommand: npm start
-    envVars:
-      - key: NODE_VERSION
-        value: 18
+    plan: starter
+    region: oregon
+    buildCommand: npm ci
+    startCommand: node index.js
     healthCheckPath: /health
     autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 18.20.3
+      - key: PEXELS_API_KEY
+        sync: false
+      - key: GOOGLE_CLIENT_ID
+        sync: false
+      - key: GOOGLE_CLIENT_SECRET
+        sync: false
